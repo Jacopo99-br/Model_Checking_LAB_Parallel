@@ -1,11 +1,10 @@
 import argparse
-from collections import deque
 from multiprocessing import Pool, cpu_count
 import time
 import numpy as np
 
 
-class ParametricInterlockingGenerator:
+class BitwiseInterlockingTopology:
 
     def __init__(
         self, num_tracks=2, switches_per_track=4, routes_per_track=5
@@ -17,141 +16,165 @@ class ParametricInterlockingGenerator:
         self.num_switches = num_tracks * switches_per_track
         self.num_routes = num_tracks * routes_per_track
 
-        self.SWITCH_NAMES = [f"s{i+1}" for i in range(self.num_switches)]
-        self.ROUTES = {}
+        self.sw_mask = (1 << self.num_switches) - 1
 
-        # Generazione itinerari locali e di scambio tra binari adiacenti
-        for t in range(num_tracks):
-            track_switches = self.SWITCH_NAMES[
-                t * switches_per_track : (t + 1) * switches_per_track
-            ]
+        # Mappatura statica di scambi per rotta e requisiti
+        # route_reqs[r] = list of (sw_idx, required_bit_val 0/1)
+        self.route_sw_reqs = []
+        self.route_locked_sw_mask = []
 
-            for r in range(routes_per_track - 1):
-                r_name = f"R_T{t+1}_{r+1}"
-                sw_subset = track_switches[: (r % switches_per_track) + 1]
-                sw_reqs = [(sw, (idx % 2) + 1) for idx, sw in enumerate(sw_subset)]
-                self.ROUTES[r_name] = {"switches": sw_reqs}
-
-            if t < num_tracks - 1:
-                r_name = f"R_CROSS_{t+1}_{t+2}"
-                next_track_switches = self.SWITCH_NAMES[
-                    (t + 1) * switches_per_track : (t + 2) * switches_per_track
-                ]
-                sw_reqs = [
-                    (track_switches[0], 2),
-                    (next_track_switches[0], 2),
-                ]
-                self.ROUTES[r_name] = {"switches": sw_reqs}
-
-        self.route_names = list(self.ROUTES.keys())
-        self.num_routes = len(self.route_names)
-
-        # Matrice delle rivali: itinerari che condividono almeno uno scambiatore
-        self.RIVALS = {r: [] for r in self.route_names}
-        for r1 in self.route_names:
-            s1_set = {sw[0] for sw in self.ROUTES[r1]["switches"]}
-            for r2 in self.route_names:
-                if r1 != r2:
-                    s2_set = {sw[0] for sw in self.ROUTES[r2]["switches"]}
-                    if not s1_set.isdisjoint(s2_set):
-                        self.RIVALS[r1].append(r2)
-
-    def get_initial_state(self):
-        switches = (0,) * self.num_switches
-        routes = (0,) * self.num_routes
-        return (switches, routes)
-
-
-_global_gen = None
-
-
-def _init_worker(gen_args):
-    global _global_gen
-    _global_gen = ParametricInterlockingGenerator(*gen_args)
-
-
-def _expand_state_chunk(state_chunk):
-    global _global_gen
-    gen = _global_gen
-    chunk_transitions = []
-
-    for curr_st in state_chunk:
-        switches, routes = curr_st
-
-        # Transizioni scambiatori
-        locked_switches = set()
-        for idx, r_st in enumerate(routes):
-            if r_st == 3:  # OCCUPIED
-                r_name = gen.route_names[idx]
-                for sw_name, _ in gen.ROUTES[r_name]["switches"]:
-                    locked_switches.add(sw_name)
-
-        for sw_idx in range(gen.num_switches):
-            sw_name = gen.SWITCH_NAMES[sw_idx]
-            if sw_name not in locked_switches:
-                new_switches = list(switches)
-                new_switches[sw_idx] = 1 - new_switches[sw_idx]
-                chunk_transitions.append((curr_st, (tuple(new_switches), routes)))
-
-        # Transizioni ciclo di vita rotte
-        for idx, r_st in enumerate(routes):
-            r_name = gen.route_names[idx]
-
-            # IDLE -> REQUESTED
-            if r_st == 0:
-                new_routes = list(routes)
-                new_routes[idx] = 1
-                chunk_transitions.append((curr_st, (switches, tuple(new_routes))))
-
-            # REQUESTED -> RESERVED
-            elif r_st == 1:
-                is_conflicting = any(
-                    routes[gen.route_names.index(rival)] in (2, 3)
-                    for rival in gen.RIVALS[r_name]
+        track_switches = [
+            list(
+                range(
+                    t * switches_per_track, (t + 1) * switches_per_track
                 )
+            )
+            for t in range(num_tracks)
+        ]
+
+        route_sw_sets = []
+
+        for t in range(num_tracks):
+            # Rotte locali al binario
+            for r in range(routes_per_track - 1):
+                sw_subset = track_switches[t][
+                    : (r % switches_per_track) + 1
+                ]
+                reqs = [(sw, (idx % 2)) for idx, sw in enumerate(sw_subset)]
+                self.route_sw_reqs.append(reqs)
+
+                mask = 0
+                for sw in sw_subset:
+                    mask |= 1 << sw
+                self.route_locked_sw_mask.append(mask)
+                route_sw_sets.append(set(sw_subset))
+
+            # Rotta di crossover tra binari
+            if t < num_tracks - 1:
+                sw_cross = [
+                    track_switches[t][0],
+                    track_switches[t + 1][0],
+                ]
+                reqs = [(sw_cross[0], 1), (sw_cross[1], 1)]
+                self.route_sw_reqs.append(reqs)
+
+                mask = (1 << sw_cross[0]) | (1 << sw_cross[1])
+                self.route_locked_sw_mask.append(mask)
+                route_sw_sets.append(set(sw_cross))
+
+        # Ricostruzione rivali: rival_mask[r] è un bitmask delle rotte in conflitto
+        self.rival_indices = []
+        for i, s1 in enumerate(route_sw_sets):
+            rivals = []
+            for j, s2 in enumerate(route_sw_sets):
+                if i != j and not s1.isdisjoint(s2):
+                    rivals.append(j)
+            self.rival_indices.append(rivals)
+
+
+_TOPOLOGY = None
+
+
+def _init_worker(args):
+    global _TOPOLOGY
+    _TOPOLOGY = BitwiseInterlockingTopology(*args)
+
+
+def _expand_uint32_chunk(chunk_states):
+    global _TOPOLOGY
+    topo = _TOPOLOGY
+    num_sw = topo.num_switches
+    num_rt = topo.num_routes
+    sw_mask = topo.sw_mask
+
+    transitions = []
+
+    for state in chunk_states:
+        switches = state & sw_mask
+        routes = state >> num_sw
+
+        # 1. Calcola maschera scambi bloccati da rotte OCCUPIED (stato 3)
+        locked_mask = 0
+        for r_idx in range(num_rt):
+            r_st = (routes >> (r_idx * 2)) & 0b11
+            if r_st == 3:  # OCCUPIED
+                locked_mask |= topo.route_locked_sw_mask[r_idx]
+
+        # 2. Transizioni Scambi (Toggle scambi non bloccati)
+        for sw_idx in range(num_sw):
+            if not (locked_mask & (1 << sw_idx)):
+                new_sw = switches ^ (1 << sw_idx)
+                next_st = (routes << num_sw) | new_sw
+                transitions.append((state, next_st))
+
+        # 3. Transizioni Rotte
+        for r_idx in range(num_rt):
+            shift = r_idx * 2
+            r_st = (routes >> shift) & 0b11
+
+            # IDLE (0) -> REQUESTED (1)
+            if r_st == 0:
+                new_routes = routes | (1 << shift)
+                next_st = (new_routes << num_sw) | switches
+                transitions.append((state, next_st))
+
+            # REQUESTED (1) -> RESERVED (2) / ANNULLA (0)
+            elif r_st == 1:
+                # Check rivali attive (stato 2 o 3)
+                is_conflicting = False
+                for rival_idx in topo.rival_indices[r_idx]:
+                    riv_st = (routes >> (rival_idx * 2)) & 0b11
+                    if riv_st >= 2:
+                        is_conflicting = True
+                        break
+
                 if not is_conflicting:
-                    sw_reqs = gen.ROUTES[r_name]["switches"]
-                    sw_ok = all(
-                        switches[gen.SWITCH_NAMES.index(sw_name)] == (req_pos - 1)
-                        for sw_name, req_pos in sw_reqs
-                    )
+                    # Check posizioni scambi
+                    sw_ok = True
+                    for sw_id, req_val in topo.route_sw_reqs[r_idx]:
+                        curr_val = (switches >> sw_id) & 1
+                        if curr_val != req_val:
+                            sw_ok = False
+                            break
+
                     if sw_ok:
-                        new_routes = list(routes)
-                        new_routes[idx] = 2
-                        chunk_transitions.append(
-                            (curr_st, (switches, tuple(new_routes)))
+                        # Clear bit 0,1 e set a 2 (0b10)
+                        new_routes = (routes & ~(0b11 << shift)) | (
+                            2 << shift
                         )
+                        next_st = (new_routes << num_sw) | switches
+                        transitions.append((state, next_st))
 
-                # Annullamento richiesta
-                new_routes = list(routes)
-                new_routes[idx] = 0
-                chunk_transitions.append((curr_st, (switches, tuple(new_routes))))
+                # Annulla a IDLE (0)
+                new_routes = routes & ~(0b11 << shift)
+                next_st = (new_routes << num_sw) | switches
+                transitions.append((state, next_st))
 
-            # RESERVED -> OCCUPIED
+            # RESERVED (2) -> OCCUPIED (3)
             elif r_st == 2:
-                new_routes = list(routes)
-                new_routes[idx] = 3
-                chunk_transitions.append((curr_st, (switches, tuple(new_routes))))
+                new_routes = (routes & ~(0b11 << shift)) | (3 << shift)
+                next_st = (new_routes << num_sw) | switches
+                transitions.append((state, next_st))
 
-            # OCCUPIED -> IDLE
+            # OCCUPIED (3) -> IDLE (0)
             elif r_st == 3:
-                new_routes = list(routes)
-                new_routes[idx] = 0
-                chunk_transitions.append((curr_st, (switches, tuple(new_routes))))
+                new_routes = routes & ~(0b11 << shift)
+                next_st = (new_routes << num_sw) | switches
+                transitions.append((state, next_st))
 
-    return chunk_transitions
+    return transitions
 
 
-def generate_lts_parallel(
+def generate_lts_fast(
     num_tracks, switches_per_track, routes_per_track, cores=None
 ):
     if cores is None:
         cores = cpu_count()
 
-    gen = ParametricInterlockingGenerator(
+    topo = BitwiseInterlockingTopology(
         num_tracks, switches_per_track, routes_per_track
     )
-    init_st = gen.get_initial_state()
+    init_st = np.uint32(0)
 
     visited = {init_st: 0}
     state_list = [init_st]
@@ -161,22 +184,26 @@ def generate_lts_parallel(
     current_frontier = [init_st]
     state_counter = 0
 
-    print(f"⚡ AVVIO GENERAZIONE PARALLELA ({cores} Cores CPU)...")
+    print(f"⚡ AVVIO GENERAZIONE ULTRA-COMPATTA ({cores} Cores CPU)...")
     print(
-        f"⚙️ Configurazione: {num_tracks} Binari | {gen.num_switches} Scambi | {gen.num_routes} Itinerari"
+        f"⚙️ Configurazione: {num_tracks} Binari | {topo.num_switches} Scambi | {topo.num_routes} Itinerari"
     )
     t0 = time.perf_counter()
 
-    gen_args = (num_tracks, switches_per_track, routes_per_track)
+    worker_args = (num_tracks, switches_per_track, routes_per_track)
 
-    with Pool(processes=cores, initializer=_init_worker, initargs=(gen_args,)) as pool:
+    with Pool(
+        processes=cores, initializer=_init_worker, initargs=(worker_args,)
+    ) as pool:
         while current_frontier:
-            chunk_size = (len(current_frontier) + cores - 1) // cores
+            # Slicing puro Python su interi uint32
+            chunk_size = max(1, (len(current_frontier) + cores - 1) // cores)
             chunks = [
                 current_frontier[i : i + chunk_size]
                 for i in range(0, len(current_frontier), chunk_size)
             ]
-            results = pool.map(_expand_state_chunk, chunks)
+
+            results = pool.map(_expand_uint32_chunk, chunks)
             next_frontier = []
 
             for chunk_res in results:
@@ -196,78 +223,49 @@ def generate_lts_parallel(
 
     t_elapsed = time.perf_counter() - t0
 
-    print("📦 Bitmasking uint32 e costruzione matrici CSR...")
-    encoded_states = []
-    num_sw = gen.num_switches
-
-    for sw, rt in state_list:
-        enc = 0
-        for i, val in enumerate(sw):
-            enc |= val << i
-        for i, val in enumerate(rt):
-            enc |= val << (num_sw + i * 2)
-        encoded_states.append(enc)
-
-    num_states = len(state_list)
-    num_edges = len(src_indices)
-
+    print("📦 Costruzione array NumPy e matrici CSR...")
+    states_arr = np.array(state_list, dtype=np.uint32)
     src_arr = np.array(src_indices, dtype=np.int32)
     dst_arr = np.array(dst_indices, dtype=np.int32)
+
+    num_states = len(states_arr)
+    num_edges = len(src_indices)
 
     counts = np.bincount(src_arr, minlength=num_states)
     offsets = np.zeros(num_states + 1, dtype=np.int32)
     offsets[1:] = np.cumsum(counts)
 
-    return (
-        num_states,
-        num_edges,
-        np.array(encoded_states, dtype=np.uint32),
-        offsets,
-        dst_arr,
-        t_elapsed,
-        gen,
-    )
+    return num_states, num_edges, states_arr, offsets, dst_arr, t_elapsed
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Generatore Parametrico e Parallelo di Benchmark Interlocking"
+        description="Generatore Bitwise Memory-Efficient di Benchmark Interlocking"
     )
     parser.add_argument(
-        "--tracks", type=int, default=2, help="Numero di binari (default: 2)"
+        "--tracks", type=int, default=2, help="Numero di binari"
     )
     parser.add_argument(
-        "--switches",
-        type=int,
-        default=4,
-        help="Scambiatori per binario (default: 4)",
+        "--switches", type=int, default=4, help="Scambi per binario"
     )
     parser.add_argument(
-        "--routes",
-        type=int,
-        default=5,
-        help="Itinerari per binario (default: 5)",
+        "--routes", type=int, default=5, help="Itinerari per binario"
     )
     parser.add_argument(
-        "--cores",
-        type=int,
-        default=cpu_count(),
-        help="Numero di core CPU (default: tutti i core disponibili)",
+        "--cores", type=int, default=cpu_count(), help="Core CPU da usare"
     )
 
     args = parser.parse_args()
 
-    n_states, n_edges, states, offsets, edges, t_gen, gen_instance = (
-        generate_lts_parallel(
-            num_tracks=args.tracks,
-            switches_per_track=args.switches,
-            routes_per_track=args.routes,
-            cores=args.cores,
-        )
+    n_states, n_edges, states, offsets, edges, t_gen = generate_lts_fast(
+        num_tracks=args.tracks,
+        switches_per_track=args.switches,
+        routes_per_track=args.routes,
+        cores=args.cores,
     )
 
     print(f"\n✅ GENERAZIONE COMPLETATA in {t_gen:.2f} s!")
-    print(f"   Stati Raggiungibili: {n_states:,}")
+    print(f"   Stati Totali: {n_states:,}")
     print(f"   Transizioni: {n_edges:,}")
 
     filename = (
@@ -281,4 +279,4 @@ if __name__ == "__main__":
         offsets=offsets,
         edges=edges,
     )
-    print(f"   File salvato: '{filename}'\n")
+    print(f"💾 File salvato con successo in: '{filename}'\n")
