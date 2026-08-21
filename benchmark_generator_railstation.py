@@ -171,9 +171,11 @@ def generate_lts_parallel(
 
     with Pool(processes=cores, initializer=_init_worker, initargs=(gen_args,)) as pool:
         while current_frontier:
-            chunks = np.array_split(current_frontier, cores)
-            chunks = [c.tolist() for c in chunks if len(c) > 0]
-
+            chunk_size = (len(current_frontier) + cores - 1) // cores
+            chunks = [
+                current_frontier[i : i + chunk_size]
+                for i in range(0, len(current_frontier), chunk_size)
+            ]
             results = pool.map(_expand_state_chunk, chunks)
             next_frontier = []
 
