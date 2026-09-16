@@ -14,14 +14,11 @@ class BitwiseInterlockingTopology:
         self.routes_per_track = routes_per_track
 
         self.num_switches = num_tracks * switches_per_track
-        self.num_routes = num_tracks * routes_per_track
-
         self.sw_mask = (1 << self.num_switches) - 1
 
-        # Mappatura statica di scambi per rotta e requisiti
-        # route_reqs[r] = list of (sw_idx, required_bit_val 0/1)
         self.route_sw_reqs = []
         self.route_locked_sw_mask = []
+        route_sw_sets = []
 
         track_switches = [
             list(
@@ -32,10 +29,8 @@ class BitwiseInterlockingTopology:
             for t in range(num_tracks)
         ]
 
-        route_sw_sets = []
-
         for t in range(num_tracks):
-            # Rotte locali al binario
+            # Rotte locali
             for r in range(routes_per_track - 1):
                 sw_subset = track_switches[t][
                     : (r % switches_per_track) + 1
@@ -49,7 +44,7 @@ class BitwiseInterlockingTopology:
                 self.route_locked_sw_mask.append(mask)
                 route_sw_sets.append(set(sw_subset))
 
-            # Rotta di crossover tra binari
+            # Rotta crossover
             if t < num_tracks - 1:
                 sw_cross = [
                     track_switches[t][0],
@@ -62,7 +57,8 @@ class BitwiseInterlockingTopology:
                 self.route_locked_sw_mask.append(mask)
                 route_sw_sets.append(set(sw_cross))
 
-        # Ricostruzione rivali: rival_mask[r] è un bitmask delle rotte in conflitto
+        self.num_routes = len(self.route_sw_reqs)
+
         self.rival_indices = []
         for i, s1 in enumerate(route_sw_sets):
             rivals = []
@@ -86,81 +82,77 @@ def _expand_uint32_chunk(chunk_states):
     num_sw = topo.num_switches
     num_rt = topo.num_routes
     sw_mask = topo.sw_mask
+    MASK32 = 0xFFFFFFFF
 
     transitions = []
 
     for state in chunk_states:
-        switches = state & sw_mask
-        routes = state >> num_sw
+        state_int = int(state)
+        switches = state_int & sw_mask
+        routes = state_int >> num_sw
 
-        # 1. Calcola maschera scambi bloccati da rotte OCCUPIED (stato 3)
+        # 1. Scambi bloccati da rotte OCCUPIED (stato 3)
         locked_mask = 0
         for r_idx in range(num_rt):
             r_st = (routes >> (r_idx * 2)) & 0b11
-            if r_st == 3:  # OCCUPIED
+            if r_st == 3:
                 locked_mask |= topo.route_locked_sw_mask[r_idx]
 
-        # 2. Transizioni Scambi (Toggle scambi non bloccati)
+        # 2. Transizioni Scambi
         for sw_idx in range(num_sw):
             if not (locked_mask & (1 << sw_idx)):
                 new_sw = switches ^ (1 << sw_idx)
-                next_st = (routes << num_sw) | new_sw
-                transitions.append((state, next_st))
+                next_st = ((routes << num_sw) | new_sw) & MASK32
+                transitions.append((state_int, next_st))
 
         # 3. Transizioni Rotte
         for r_idx in range(num_rt):
             shift = r_idx * 2
             r_st = (routes >> shift) & 0b11
+            clear_mask = MASK32 ^ (0b11 << shift)
 
-            # IDLE (0) -> REQUESTED (1)
+            # IDLE -> REQUESTED
             if r_st == 0:
                 new_routes = routes | (1 << shift)
-                next_st = (new_routes << num_sw) | switches
-                transitions.append((state, next_st))
+                next_st = ((new_routes << num_sw) | switches) & MASK32
+                transitions.append((state_int, next_st))
 
-            # REQUESTED (1) -> RESERVED (2) / ANNULLA (0)
+            # REQUESTED -> RESERVED / ANNULLA
             elif r_st == 1:
-                # Check rivali attive (stato 2 o 3)
                 is_conflicting = False
                 for rival_idx in topo.rival_indices[r_idx]:
-                    riv_st = (routes >> (rival_idx * 2)) & 0b11
-                    if riv_st >= 2:
+                    if ((routes >> (rival_idx * 2)) & 0b11) >= 2:
                         is_conflicting = True
                         break
 
                 if not is_conflicting:
-                    # Check posizioni scambi
                     sw_ok = True
                     for sw_id, req_val in topo.route_sw_reqs[r_idx]:
-                        curr_val = (switches >> sw_id) & 1
-                        if curr_val != req_val:
+                        if ((switches >> sw_id) & 1) != req_val:
                             sw_ok = False
                             break
 
                     if sw_ok:
-                        # Clear bit 0,1 e set a 2 (0b10)
-                        new_routes = (routes & ~(0b11 << shift)) | (
-                            2 << shift
-                        )
-                        next_st = (new_routes << num_sw) | switches
-                        transitions.append((state, next_st))
+                        new_routes = (routes & clear_mask) | (2 << shift)
+                        next_st = ((new_routes << num_sw) | switches) & MASK32
+                        transitions.append((state_int, next_st))
 
-                # Annulla a IDLE (0)
-                new_routes = routes & ~(0b11 << shift)
-                next_st = (new_routes << num_sw) | switches
-                transitions.append((state, next_st))
+                # Annulla a IDLE
+                new_routes = routes & clear_mask
+                next_st = ((new_routes << num_sw) | switches) & MASK32
+                transitions.append((state_int, next_st))
 
-            # RESERVED (2) -> OCCUPIED (3)
+            # RESERVED -> OCCUPIED
             elif r_st == 2:
-                new_routes = (routes & ~(0b11 << shift)) | (3 << shift)
-                next_st = (new_routes << num_sw) | switches
-                transitions.append((state, next_st))
+                new_routes = (routes & clear_mask) | (3 << shift)
+                next_st = ((new_routes << num_sw) | switches) & MASK32
+                transitions.append((state_int, next_st))
 
-            # OCCUPIED (3) -> IDLE (0)
+            # OCCUPIED -> IDLE
             elif r_st == 3:
-                new_routes = routes & ~(0b11 << shift)
-                next_st = (new_routes << num_sw) | switches
-                transitions.append((state, next_st))
+                new_routes = routes & clear_mask
+                next_st = ((new_routes << num_sw) | switches) & MASK32
+                transitions.append((state_int, next_st))
 
     return transitions
 
@@ -174,10 +166,10 @@ def generate_lts_fast(
     topo = BitwiseInterlockingTopology(
         num_tracks, switches_per_track, routes_per_track
     )
-    init_st = np.uint32(0)
+    init_st = 0
 
     visited = {init_st: 0}
-    state_list = [init_st]
+    state_list = [np.uint32(init_st)]
     src_indices = []
     dst_indices = []
 
@@ -186,7 +178,7 @@ def generate_lts_fast(
 
     print(f"⚡ AVVIO GENERAZIONE ULTRA-COMPATTA ({cores} Cores CPU)...")
     print(
-        f"⚙️ Configurazione: {num_tracks} Binari | {topo.num_switches} Scambi | {topo.num_routes} Itinerari"
+        f"⚙️ Configurazione: {num_tracks} Binari | {topo.num_switches} Scambi | {topo.num_routes} Itinerari Totali"
     )
     t0 = time.perf_counter()
 
@@ -196,7 +188,6 @@ def generate_lts_fast(
         processes=cores, initializer=_init_worker, initargs=(worker_args,)
     ) as pool:
         while current_frontier:
-            # Slicing puro Python su interi uint32
             chunk_size = max(1, (len(current_frontier) + cores - 1) // cores)
             chunks = [
                 current_frontier[i : i + chunk_size]
@@ -213,7 +204,7 @@ def generate_lts_fast(
                     if nxt not in visited:
                         state_counter += 1
                         visited[nxt] = state_counter
-                        state_list.append(nxt)
+                        state_list.append(np.uint32(nxt))
                         next_frontier.append(nxt)
 
                     src_indices.append(curr_idx)
@@ -240,7 +231,7 @@ def generate_lts_fast(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Generatore Bitwise Memory-Efficient di Benchmark Interlocking"
+        description="Generatore Bitwise Memory-Safe di Benchmark Interlocking"
     )
     parser.add_argument(
         "--tracks", type=int, default=2, help="Numero di binari"
@@ -269,7 +260,7 @@ if __name__ == "__main__":
     print(f"   Transizioni: {n_edges:,}")
 
     filename = (
-        f"interlocking_{args.tracks}tracks_{args.switches}sw_{args.routes}routes.npz"
+        f"NEW_interlocking_{args.tracks}tracks_{args.switches}sw_{args.routes}routes.npz"
     )
     np.savez_compressed(
         filename,
