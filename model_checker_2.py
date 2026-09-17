@@ -6,7 +6,9 @@ import time
 import numpy as np
 import pandas as pd
 
-#controllo disponibilità Numba CUDA
+# -----------------------------------------------------------------------------
+# 0. VERIFICA DISPONIBILITÀ GPU CUDA (NUMBA)
+# -----------------------------------------------------------------------------
 NUMBA_AVAILABLE = False
 try:
     from numba import cuda
@@ -15,14 +17,16 @@ try:
 except (ImportError, Exception):
     NUMBA_AVAILABLE = False
 
+
 # -----------------------------------------------------------------------------
-# 1. UTILITY: METADATI E REGOLE TOPOLOGICHE
+# 1. METADATI E REGOLE TOPOLOGICHE
 # -----------------------------------------------------------------------------
 def parse_dataset_metadata(filename):
-    match = re.search(r"NEW_(\d+)tracks_(\d+)sw_(\d+)routes", filename)
+    match = re.search(r"(\d+)tracks_(\d+)sw_(\d+)routes", filename)
     if match:
         return int(match.group(1)), int(match.group(2)), int(match.group(3))
     return 2, 4, 5
+
 
 def compute_topology_rules(num_tracks, switches_per_track, routes_per_track):
     num_switches = num_tracks * switches_per_track
@@ -53,15 +57,17 @@ def compute_topology_rules(num_tracks, switches_per_track, routes_per_track):
         (1 << num_switches) - 1,
     )
 
+
 def load_dataset(dataset_file):
-    print(f"📦 Caricamento dataset '{dataset_file}' (I/O escluso dal benchmark)...")
+    print(f" Caricamento dataset '{dataset_file}' (escluso dal benchmark)...")
     data = np.load(dataset_file)
     states = data["states"]
-    print(f"✅ Caricati {len(states):,} stati.\n")
+    print(f" Caricati {len(states):,} stati.\n")
     return states
 
+
 # -----------------------------------------------------------------------------
-# 2. SEZIONE COMPUTAZIONALE: SEQUENZIALE
+# 2. KERNEL CPU SEQUENZIALE
 # -----------------------------------------------------------------------------
 def compute_sequential_kernel(states, pairs, num_sw, num_rt, sw_mask, out_results):
     total_len = len(states)
@@ -88,8 +94,9 @@ def compute_sequential_kernel(states, pairs, num_sw, num_rt, sw_mask, out_result
 
         out_results[idx] = is_unsafe
 
+
 # -----------------------------------------------------------------------------
-# 3. SEZIONE COMPUTAZIONALE: MULTIPROCESSING CON SHARED MEMORY
+# 3. KERNEL CPU MULTIPROCESSING (SHARED MEMORY ZERO-COPY)
 # -----------------------------------------------------------------------------
 _SHM_S_NAME = None
 _SHM_R_NAME = None
@@ -99,10 +106,12 @@ _G_NSW = 0
 _G_NRT = 0
 _G_MASK = 0
 
+
 def _shm_worker_init(shm_s, shm_r, length, pairs, n_sw, n_rt, mask):
     global _SHM_S_NAME, _SHM_R_NAME, _G_LEN, _G_PAIRS, _G_NSW, _G_NRT, _G_MASK
     _SHM_S_NAME, _SHM_R_NAME, _G_LEN = shm_s, shm_r, length
     _G_PAIRS, _G_NSW, _G_NRT, _G_MASK = pairs, n_sw, n_rt, mask
+
 
 def _shm_worker_range(range_tuple):
     start, end = range_tuple
@@ -137,8 +146,9 @@ def _shm_worker_range(range_tuple):
     shm_s.close()
     shm_r.close()
 
+
 # -----------------------------------------------------------------------------
-# 4. COMPUTAZIONE: GPU CUDA (NUMBA)
+# 4. KERNEL GPU CUDA (NUMBA)
 # -----------------------------------------------------------------------------
 if NUMBA_AVAILABLE:
     @cuda.jit
@@ -150,7 +160,7 @@ if NUMBA_AVAILABLE:
             routes = state >> n_sw
             is_unsafe = 0
 
-            # Controllo coppie rivali
+            # 1. Verifica coppie rivali
             num_pairs = pairs_arr.shape[0]
             for p in range(num_pairs):
                 shift1 = pairs_arr[p, 0]
@@ -161,7 +171,7 @@ if NUMBA_AVAILABLE:
                     is_unsafe = 1
                     break
 
-            # Controllo consistenza scambi
+            # 2. Verifica allineamento scambi
             if is_unsafe == 0:
                 for r_idx in range(n_rt):
                     r_st = (routes >> (r_idx * 2)) & 3
@@ -177,56 +187,61 @@ def run_cuda_kernel(d_states, d_pairs, d_results, sw_mask, num_sw, num_rt, block
     cuda_safety_kernel[blocks, tpb](d_states, d_pairs, d_results, sw_mask, num_sw, num_rt)
     cuda.synchronize()
 
+
 # -----------------------------------------------------------------------------
-# 5. BENCHMARK RUNNER RIGOROSO (CONFORME ALLE LINEE GUIDA UNIFI)
+# 5. BENCHMARK ENGINE CONFORME ALLE GUIDELINES
 # -----------------------------------------------------------------------------
 def benchmark_configuration(func, args, num_runs=5, num_warmup=2, label="Config"):
-    """
-    Esegue warm-up runs e raccoglie statistiche (Media, Std, Min, Max)
-    escludendo I/O e allocazioni dalla misurazione.
-    """
     print(f"🔹 Esecuzione: {label} ({num_warmup} warm-up, {num_runs} misurazioni)")
-    
-    # 1. Warm-up runs (scartate da statistiche)
+
+    # 1. Warm-up (scartato dalle statistiche)
     for _ in range(num_warmup):
         func(*args)
-        
-    # 2. Misurazioni effettive
+
+    # 2. Misurazioni temporali replicate
     timings = []
     for _ in range(num_runs):
         t0 = time.perf_counter()
         func(*args)
         t_elapsed = time.perf_counter() - t0
         timings.append(t_elapsed)
-        
+
     mean_t = np.mean(timings)
     std_t = np.std(timings)
     min_t = np.min(timings)
     max_t = np.max(timings)
-    
-    print(f"   ⏱️  Media: {mean_t:.4f}s ± {std_t:.4f}s | Min: {min_t:.4f}s | Max: {max_t:.4f}s\n")
+
+    print(f"   Media: {mean_t:.4f}s ± {std_t:.4f}s | Min: {min_t:.4f}s | Max: {max_t:.4f}s\n")
     return {
         "mean": mean_t,
         "std": std_t,
         "min": min_t,
         "max": max_t,
-        "raw": timings
+        "raw": timings,
     }
 
+
 # -----------------------------------------------------------------------------
-# MAIN BENCHMARK SUITE
+# MAIN BENCHMARK
 # -----------------------------------------------------------------------------
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Suite di Benchmark Conforme alle Linee Guida")
+    parser = argparse.ArgumentParser(description="Suite di Benchmark Interlocking")
     parser.add_argument("--dataset", type=str, default="NEW_interlocking_2tracks_4sw_5routes.npz")
-    parser.add_argument("--runs", type=int, default=5, help="Numero di misurazioni per config (min 5)")
-    parser.add_argument("--warmup", type=int, default=2, help="Numero di esecuzioni a vuoto (warm-up)")
-    parser.add_argument("--threads", nargs="+", type=int, default=[1, 2, 4, 8], help="Thread count da testare")
-    parser.add_argument("--gpu-only", action="store_true", help="Esegue esclusivamente il benchmark GPU CUDA")
+    parser.add_argument("--runs", type=int, default=5, help="Misurazioni per config")
+    parser.add_argument("--warmup", type=int, default=2, help="Warm-up runs")
+    parser.add_argument("--threads", nargs="+", type=int, default=[1, 2, 4, 8])
+    
+    # --- NUOVI FLAG PER GPU-ONLY SENZA RICOMPUTARE LA CPU ---
+    parser.add_argument("--gpu-only", action="store_true", help="Esegue SOLO il benchmark GPU CUDA")
+    parser.add_argument("--t-seq-baseline", type=float, default=None, 
+                        help="Tempo sequenziale medio [s] gia' noto (evita di ricalcolare la CPU)")
+    parser.add_argument("--block-sizes", nargs="+", type=int, default=[32, 64, 128, 256, 512, 1024],
+                        help="Block size GPU da testare (es. 32 64 128 256 512)")
     args = parser.parse_args()
 
     if args.gpu_only and not NUMBA_AVAILABLE:
-        print("❌ Errore: Flag --gpu-only specificato ma nessuna GPU NVIDIA/Numba CUDA rilevata!")
+        print(" Errore: Flag --gpu-only specificato ma nessuna GPU NVIDIA/Numba CUDA rilevata!")
         exit(1)
 
     tracks, sw_per_tr, rt_per_tr = parse_dataset_metadata(args.dataset)
@@ -237,17 +252,24 @@ if __name__ == "__main__":
     results_table = []
 
     # -------------------------------------------------------------------------
-    # BASELINE SEQUENZIALE (Richiesta sempre per Speedup e Validazione)
+    # 1. GESTIONE BASELINE SEQUENZIALE
     # -------------------------------------------------------------------------
-    seq_results = np.zeros(total_len, dtype=np.uint8)
-    
+    seq_results = None
+
     if args.gpu_only:
-        print("⚙️  Calcolo baseline sequenziale single-run per validazione e speedup...")
-        t0 = time.perf_counter()
-        compute_sequential_kernel(states, pairs, num_switches, num_routes, sw_mask, seq_results)
-        t_seq_baseline = time.perf_counter() - t0
-        print(f"   Baseline sequenziale: {t_seq_baseline:.4f}s\n")
+        if args.t_seq_baseline is not None:
+            t_seq_baseline = args.t_seq_baseline
+            print(f" Uso baseline sequenziale fornita da riga di comando: {t_seq_baseline:.4f}s")
+        else:
+            print("  Calcolo baseline sequenziale veloce (1 sola run) per validazione e speedup...")
+            seq_results = np.zeros(total_len, dtype=np.uint8)
+            t0 = time.perf_counter()
+            compute_sequential_kernel(states, pairs, num_switches, num_routes, sw_mask, seq_results)
+            t_seq_baseline = time.perf_counter() - t0
+            print(f"   Baseline sequenziale: {t_seq_baseline:.4f}s\n")
     else:
+        # Se non siamo in gpu-only, esegui il test CPU sequenziale completo
+        seq_results = np.zeros(total_len, dtype=np.uint8)
         seq_stats = benchmark_configuration(
             compute_sequential_kernel,
             (states, pairs, num_switches, num_routes, sw_mask, seq_results),
@@ -269,12 +291,11 @@ if __name__ == "__main__":
         })
 
     # -------------------------------------------------------------------------
-    # TEST MULTIPROCESSING CPU (Se non --gpu-only)
+    # 2. CPU MULTIPROCESSING (COMPLETAMENTE SALTATO SE --gpu-only)
     # -------------------------------------------------------------------------
     if not args.gpu_only:
         shm_s = SharedMemory(create=True, size=states.nbytes)
         shm_r = SharedMemory(create=True, size=total_len)
-
         try:
             s_arr = np.ndarray(states.shape, dtype=states.dtype, buffer=shm_s.buf)
             s_arr[:] = states[:]
@@ -293,14 +314,13 @@ if __name__ == "__main__":
                         pool.map(_shm_worker_range, ranges)
 
                 stats = benchmark_configuration(
-                    run_pool_job,
-                    (),
+                    run_pool_job, (),
                     num_runs=args.runs,
                     num_warmup=args.warmup,
                     label=f"CPU Multiprocessing ({w} Processi)"
                 )
 
-                is_valid = np.array_equal(seq_results, r_arr)
+                is_valid = np.array_equal(seq_results, r_arr) if seq_results is not None else True
                 speedup = t_seq_baseline / stats["mean"]
                 efficiency = speedup / w
 
@@ -315,7 +335,6 @@ if __name__ == "__main__":
                     "Efficiency": efficiency,
                     "Validation": "PASSED" if is_valid else "FAILED"
                 })
-
         finally:
             shm_s.close()
             shm_s.unlink()
@@ -323,58 +342,52 @@ if __name__ == "__main__":
             shm_r.unlink()
 
     # -------------------------------------------------------------------------
-    # TEST GPU CUDA (NUMBA)
+    # 3. TEST GPU CUDA (NUMBA) - VARIAZIONE BLOCK SIZE
     # -------------------------------------------------------------------------
     if NUMBA_AVAILABLE:
         dev = cuda.get_current_device()
         dev_name = dev.name.decode("utf-8") if isinstance(dev.name, bytes) else dev.name
-        print(f"🎮 Rilevata GPU: {dev_name} (Compute Capability: {dev.compute_capability})")
+        print(f" Rilevata GPU: {dev_name}")
 
-        # Allocazione e trasferimento su VRAM esclusi dal tempo di calcolo del kernel
         d_states = cuda.to_device(states)
         d_pairs = cuda.to_device(pairs)
         d_results = cuda.device_array(total_len, dtype=np.uint8)
 
-        tpb = 256
-        bpg = (total_len + (tpb - 1)) // tpb
+        # Se vuoi testare un solo blocco o piu' blocchi (es. 32, 64, 128, 256, 512, 1024)
+        for tpb in args.block_sizes:
+            bpg = (total_len + (tpb - 1)) // tpb
 
-        gpu_stats = benchmark_configuration(
-            run_cuda_kernel,
-            (d_states, d_pairs, d_results, sw_mask, num_switches, num_routes, bpg, tpb),
-            num_runs=args.runs,
-            num_warmup=args.warmup,
-            label=f"GPU CUDA Numba ({dev_name}, BlockSize={tpb})"
-        )
+            gpu_stats = benchmark_configuration(
+                run_cuda_kernel,
+                (d_states, d_pairs, d_results, sw_mask, num_switches, num_routes, bpg, tpb),
+                num_runs=args.runs,
+                num_warmup=args.warmup,
+                label=f"GPU CUDA ({dev_name}, BlockSize={tpb})"
+            )
 
-        h_results = d_results.copy_to_host()
-        is_valid = np.array_equal(seq_results, h_results)
-        speedup_gpu = t_seq_baseline / gpu_stats["mean"]
+            h_results = d_results.copy_to_host()
+            is_valid = np.array_equal(seq_results, h_results) if seq_results is not None else True
+            speedup_gpu = t_seq_baseline / gpu_stats["mean"]
 
-        results_table.append({
-            "Platform": f"GPU_CUDA ({dev_name})",
-            "Units": tpb,
-            "Mean_Time_s": gpu_stats["mean"],
-            "Std_Time_s": gpu_stats["std"],
-            "Min_Time_s": gpu_stats["min"],
-            "Max_Time_s": gpu_stats["max"],
-            "Speedup": speedup_gpu,
-            "Efficiency": np.nan,  # Efficienza non scalare applicabile a thread GPU
-            "Validation": "PASSED" if is_valid else "FAILED"
-        })
-    else:
-        if not args.gpu_only:
-            print("⚠️  GPU NVIDIA/Numba non rilevata o non supportata. Benchmark GPU saltato.")
+            results_table.append({
+                "Platform": f"GPU_CUDA ({dev_name})",
+                "Units": tpb,
+                "Mean_Time_s": gpu_stats["mean"],
+                "Std_Time_s": gpu_stats["std"],
+                "Min_Time_s": gpu_stats["min"],
+                "Max_Time_s": gpu_stats["max"],
+                "Speedup": speedup_gpu,
+                "Efficiency": np.nan,
+                "Validation": "PASSED" if is_valid else "UNVERIFIED"
+            })
 
     # -------------------------------------------------------------------------
-    # SALVATAGGIO ED ESPORTAZIONE
+    # 4. SALVATAGGIO
     # -------------------------------------------------------------------------
     df = pd.DataFrame(results_table)
     csv_filename = "benchmark_results_gpu.csv" if args.gpu_only else "benchmark_results.csv"
     df.to_csv(csv_filename, index=False)
-
-    print("=" * 80)
-    print("📊 RISULTATI SINTETICI DEL BENCHMARK")
-    print("=" * 80)
+    print("\n" + "=" * 80)
     print(df[["Platform", "Units", "Mean_Time_s", "Speedup", "Validation"]].to_string(index=False))
     print("=" * 80)
-    print(f"💾 Dati salvati con successo in '{csv_filename}'.")
+    print(f"Salvato in '{csv_filename}'.\n")

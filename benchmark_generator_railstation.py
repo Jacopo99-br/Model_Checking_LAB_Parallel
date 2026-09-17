@@ -176,9 +176,9 @@ def generate_lts_fast(
     current_frontier = [init_st]
     state_counter = 0
 
-    print(f"⚡ AVVIO GENERAZIONE ULTRA-COMPATTA ({cores} Cores CPU)...")
+    print(f" AVVIO GENERAZIONE ULTRA-COMPATTA ({cores} Cores CPU)...")
     print(
-        f"⚙️ Configurazione: {num_tracks} Binari | {topo.num_switches} Scambi | {topo.num_routes} Itinerari Totali"
+        f" Configurazione: {num_tracks} Binari | {topo.num_switches} Scambi | {topo.num_routes} Itinerari Totali"
     )
     t0 = time.perf_counter()
 
@@ -214,7 +214,7 @@ def generate_lts_fast(
 
     t_elapsed = time.perf_counter() - t0
 
-    print("📦 Costruzione array NumPy e matrici CSR...")
+    print(" Costruzione array NumPy e matrici CSR...")
     states_arr = np.array(state_list, dtype=np.uint32)
     src_arr = np.array(src_indices, dtype=np.int32)
     dst_arr = np.array(dst_indices, dtype=np.int32)
@@ -255,7 +255,7 @@ if __name__ == "__main__":
         cores=args.cores,
     )
 
-    print(f"\n✅ GENERAZIONE COMPLETATA in {t_gen:.2f} s!")
+    print(f"\n GENERAZIONE COMPLETATA in {t_gen:.2f} s!")
     print(f"   Stati Totali: {n_states:,}")
     print(f"   Transizioni: {n_edges:,}")
 
@@ -270,4 +270,4 @@ if __name__ == "__main__":
         offsets=offsets,
         edges=edges,
     )
-    print(f"💾 File salvato con successo in: '{filename}'\n")
+    print(f" File salvato con successo in: '{filename}'\n")
